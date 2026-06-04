@@ -1,0 +1,39 @@
+1. What do "Small_10V_20S" and "Medium_30V_50S" mean?
+This is a standard academic naming convention for benchmark instances:
+- 10V_20S: An instance with 10 Vehicles and 20 Spots. We consider this "Small" because the mathematical search space is tiny, allowing Exact algorithms (like MILP) to find the answer instantly.
+- 30V_50S: An instance with 30 Vehicles and 50 Spots. We consider this "Medium". Notice that in the benchmark, the Exact MILP took almost a full second here. If we scaled this to 500 Vehicles, the exact algorithms would crash or take years, which is why we need Metaheuristics!
+
+2. Detailed Explanation of the 4 Models (How they work step-by-step)
+
+Model 1: Exact MILP (Mixed Integer Linear Programming)
+Located in: src/algorithms/exact_milp.py
+This is a mathematical model. It does not "guess"; it proves the absolute optimal answer.
+- Define Variables: It creates a binary matrix X[v,s]. If it's 1, vehicle v is parked in spot s.
+- Set Costs: It calculates the cost (distance, floor penalty, EV mismatch) for every possible pair.
+- Temporal Constraint (The Magic): It looks at the arrival and departure times of every vehicle. It groups overlapping vehicles into "cliques". It forces the mathematical solver to ensure that SUM(X) <= 1 for any spot across overlapping vehicles (meaning two cars can't be in the same spot at the same time).
+- Solve: It hands these mathematical equations to a backend solver (PuLP/CBC) which calculates the mathematically flawless assignment.
+
+Model 2: Exact Branch & Bound (B&B)
+Located in: src/algorithms/exact_bb.py
+This is an exact tree-search algorithm.
+- Sort & Setup: It sorts all vehicles chronologically by arrival time.
+- Branching (The Tree): For the first vehicle, it creates a "branch" for every single valid parking spot. Then it moves to the second vehicle and branches again.
+- Bounding: Before assigning a spot, it checks: "If I assign the car here, will the total cost be worse than the best solution I already found?"
+- Pruning: If the answer is yes, it prunes (chops off) that entire branch of the tree, saving massive amounts of computational time. It eventually finds the true optimal answer by systematically proving which branches are bad.
+
+Model 3: Genetic Algorithm (GA)
+Located in: src/algorithms/meta_ga.py
+This is a Metaheuristic inspired by biological evolution. It doesn't guarantee the best answer, but finds a great answer quickly.
+- Initialization: It creates a "population" of 20 completely random parking assignments (chromosomes).
+- Evaluation: It scores them. Solutions with shorter walking distances and no EV violations survive.
+- Crossover: It takes two good assignments (parents) and splices them together to create a "child" assignment.
+- Repair Operator: If a child accidentally has two cars assigned to the same spot at the same time, a custom Repair algorithm steps in, finds the chronological conflict, and kicks the newer car to a random free spot.
+- Evolution: It repeats this survival-of-the-fittest for 50 generations, eventually settling on a highly optimized mapping.
+
+Model 4: Simulated Annealing (SA)
+Located in: src/algorithms/meta_sa.py
+This is a Metaheuristic inspired by metallurgy (cooling metals to remove defects).
+- Start: It generates one random parking assignment and calculates its cost.
+- High Temperature (Exploration): The algorithm acts sporadically. It randomly un-parks a vehicle and moves it somewhere else. If the move is worse (increases walking distance), the algorithm might accept it anyway! This prevents the algorithm from getting stuck in a local trap.
+- Cooling (Exploitation): Slowly, the "temperature" drops. The algorithm becomes greedier. It stops accepting bad moves and only accepts moves that strictly reduce the walking distance.
+- Result: Once fully cooled, the cars have "settled" into an extremely optimal, low-cost configuration.
