@@ -85,18 +85,22 @@ def extract_distributions(df: pd.DataFrame) -> dict:
         # Uniform fallback
         arrival_by_hour = {h: 1 / 24 for h in range(24)}
 
-    # 5. Mean inter-arrival gap (minutes)  ───────────────────────────────────
-    # Rough estimate: if dataset spans ~1 year and has N rows
-    n = len(df)
-    span_minutes = 365 * 24 * 60
-    mean_interarrival_min = span_minutes / max(n, 1)
+    # 5. Target occupancy level ─────────────────────────────────────────────
+    # The dataset timestamps span years and should not be interpreted as the
+    # arrival process for one garage scenario. We instead use the observed
+    # occupancy rate as a density target for synthetic instances.
+    if "occupancy_rate" in df.columns:
+        target_occupancy = float(df["occupancy_rate"].mean())
+        target_occupancy = float(np.clip(target_occupancy, 0.20, 0.95))
+    else:
+        target_occupancy = 0.75
 
     return {
         "vehicle_type_probs":   vehicle_type_probs,
         "ev_fraction":          ev_fraction,
         "duration_lognormal":   duration_lognormal,
         "arrival_by_hour":      arrival_by_hour,
-        "mean_interarrival_min": mean_interarrival_min,
+        "target_occupancy":      target_occupancy,
     }
 
 
@@ -116,7 +120,7 @@ def summarise(csv_path: str = "data.csv") -> None:
     print(f"Duration (log-normal):  mu={ln['mu']:.2f}, sigma={ln['sigma']:.2f}")
     median_dur = np.exp(ln["mu"])
     print(f"  → median duration ~{median_dur:.0f} min ({median_dur/60:.1f} h)")
-    print(f"\nMean inter-arrival: {dist['mean_interarrival_min']:.1f} min")
+    print(f"\nTarget occupancy:   {dist['target_occupancy']*100:.1f}%")
     print()
 
 

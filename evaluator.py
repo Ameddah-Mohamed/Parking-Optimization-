@@ -9,7 +9,7 @@ Metrics:
   - unassigned_rate     : fraction of vehicles with no space
   - total_cost          : raw objective value from the solver
   - size_violation_rate : fraction of assignments with size mismatch
-  - floor_load          : dict {floor: n_vehicles_assigned}
+  - floor_load          : dict {floor: peak simultaneous vehicles assigned}
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ class Metrics:
             f"  EV satisfaction     : {ev_pct:.1f}%\n"
             f"  Unassigned vehicles : {un_pct:.1f}%\n"
             f"  Size violations     : {sv_pct:.1f}%\n"
-            f"  Floor load          : {fl_str}\n"
+            f"  Peak floor occupancy: {fl_str}\n"
             f"  Runtime             : {self.runtime_sec:.3f}s"
         )
 
@@ -68,7 +68,7 @@ def evaluate(assignment, instance) -> Metrics:
     ev_satisfied   = []
     unassigned     = 0
     size_violations = 0
-    floor_load     = {f: 0 for f in spaces["floor"].unique()}
+    floor_events   = {int(f): [] for f in spaces["floor"].unique()}
 
     for _, v in vehicles.iterrows():
         sid = assignment.mapping.get(v["vehicle_id"])
@@ -88,13 +88,25 @@ def evaluate(assignment, instance) -> Metrics:
         if not is_size_compatible(v["size_needed"], s["size"]):
             size_violations += 1
 
-        floor_load[int(s["floor"])] += 1
+        floor = int(s["floor"])
+        floor_events[floor].append((float(v["arrival_time"]), 1))
+        floor_events[floor].append((float(v["arrival_time"] + v["duration_min"]), -1))
 
     n = len(vehicles)
     avg_dist    = float(np.mean(distances)) if distances else 0.0
     ev_rate     = float(np.mean(ev_satisfied)) if ev_satisfied else 1.0  # no EVs = perfect
     unassign_rt = unassigned / n if n > 0 else 0.0
     size_vio_rt = size_violations / n if n > 0 else 0.0
+
+    peak_floor_load = {}
+    for floor, events in floor_events.items():
+        current = 0
+        peak = 0
+        # Departures before arrivals at the same timestamp, matching solver reuse.
+        for _, delta in sorted(events, key=lambda item: (item[0], item[1])):
+            current += delta
+            peak = max(peak, current)
+        peak_floor_load[floor] = peak
 
     return Metrics(
         solver=assignment.solver,
@@ -103,7 +115,7 @@ def evaluate(assignment, instance) -> Metrics:
         ev_satisfaction=ev_rate,
         unassigned_rate=unassign_rt,
         size_violation_rate=size_vio_rt,
-        floor_load=floor_load,
+        floor_load=peak_floor_load,
         runtime_sec=assignment.runtime,
     )
 

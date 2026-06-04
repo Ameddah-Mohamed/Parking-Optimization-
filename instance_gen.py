@@ -177,6 +177,7 @@ def generate_vehicles(
             "ev_fraction":           0.20,
             "duration_lognormal":    {"mu": 3.5, "sigma": 0.6},
             "mean_interarrival_min": 3.0,
+            "target_occupancy":       0.75,
         }
 
     vtype_labels = list(distributions["vehicle_type_probs"].keys())
@@ -249,7 +250,19 @@ def create_instance(
 
     spaces      = generate_spaces(n_floors, spaces_per_floor, rng)
     dist_matrix, exit_dist = build_distance_matrix(spaces)
-    vehicles    = generate_vehicles(n_vehicles, distributions, rng)
+
+    demand_distributions = dict(distributions) if distributions is not None else None
+    if demand_distributions is not None and "target_occupancy" in demand_distributions:
+        ln = demand_distributions["duration_lognormal"]
+        expected_duration = float(np.exp(ln["mu"] + (ln["sigma"] ** 2) / 2))
+        target_occupancy = float(np.clip(demand_distributions["target_occupancy"], 0.20, 0.95))
+        expected_active_vehicles = target_occupancy * len(spaces)
+        demand_distributions["mean_interarrival_min"] = max(
+            0.5,
+            expected_duration / max(expected_active_vehicles, 1.0),
+        )
+
+    vehicles    = generate_vehicles(n_vehicles, demand_distributions, rng)
 
     return ParkingInstance(
         n_floors=n_floors,

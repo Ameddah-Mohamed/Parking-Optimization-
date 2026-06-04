@@ -7,9 +7,9 @@ Two assignment strategies:
                       Assigns each arriving vehicle to the nearest compatible
                       available space. Serves as the baseline.
 
-  2. ILPSolver      — Batch Integer Linear Program (PuLP + CBC).
-                      Optimal for a fixed snapshot of vehicles and spaces.
-                      Used for comparison on small/medium instances.
+  2. ILPSolver      — Time-indexed binary integer program.
+                      Optimal for a known arrival/departure stream on
+                      small/medium instances.
 
 Both return an Assignment object.
 """
@@ -221,33 +221,43 @@ class GreedySolver:
 
 class ILPSolver:
     """
-    Batch Integer Linear Program using PuLP.
+    Binary Integer Linear Program.
 
     Decision variables:
       x[v, s] ∈ {0, 1}  =  1 if vehicle v is assigned to space s
+      y[v]    ∈ {0, 1}  =  1 if vehicle v cannot be assigned
 
     Objective (minimise):
-      Σ_{v,s} x[v,s] * cost(v, s)
+      Σ_{v,s} x[v,s] * cost(v, s) + big_penalty * Σ_v y[v]
 
     Constraints:
-      (1) Each vehicle assigned to exactly one space.
-      (2) Each space used by at most one vehicle.
-      (3) Size compatibility: x[v,s] = 0 if space too small.
-      (4) EV soft constraint via high penalty in objective.
+      (1) Each vehicle is assigned to one real space or the unassigned dummy.
+      (2) Two vehicles with overlapping parking intervals cannot use the same
+          physical space.
+      (3) Size compatibility is hard: x[v,s] = 0 if space too small.
+      (4) Required EV charging is hard: x[v,s] = 0 if an EV needs charging and
+          the space has no charger.
 
-    Note: this is a static/batch solver — it sees all vehicles at once.
+    Note: this is an offline solver. It sees all arrivals/departures in advance,
+    so it is a benchmark lower bound rather than a deployable online policy.
     For large instances (>60 vehicles) use time_limit_sec to cap runtime.
     """
 
-    def __init__(self, weights: dict = None, time_limit_sec: int = 60):
+    def __init__(self, weights: dict = None, time_limit_sec: int = 60, unassigned_penalty: float = None):
         self.weights = weights or {"distance": 1.0, "congestion": 0.5, "penalty": 50.0}
         self.time_limit_sec = time_limit_sec
+        self.unassigned_penalty = (
+            unassigned_penalty
+            if unassigned_penalty is not None
+            else self.weights.get("penalty", 50.0) * 10
+        )
 
     def solve(self, instance) -> Assignment:
         try:
-            import pulp
+            from scipy.optimize import Bounds, LinearConstraint, milp
+            from scipy.sparse import coo_array
         except ImportError:
-            raise ImportError("PuLP is required for ILPSolver. Run: pip install pulp")
+            raise ImportError("SciPy >= 1.11 is required for ILPSolver.")
 
         t0 = time.perf_counter()
         spaces   = instance.spaces
@@ -257,61 +267,118 @@ class ILPSolver:
 
         V = list(vehicles["vehicle_id"])
         S = list(spaces["space_id"])
+        n_v = len(V)
+        n_s = len(S)
         space_idx = {row["space_id"]: i for i, row in spaces.iterrows()}
         veh_map   = {row["vehicle_id"]: row for _, row in vehicles.iterrows()}
         spc_map   = {row["space_id"]:   row for _, row in spaces.iterrows()}
 
-        # Pre-compute cost matrix and feasibility mask
-        cost = {}
-        feasible = {}
-        for vid in V:
+        def x_idx(v_i: int, s_i: int) -> int:
+            return v_i * n_s + s_i
+
+        def y_idx(v_i: int) -> int:
+            return n_v * n_s + v_i
+
+        n_vars = n_v * n_s + n_v
+        c = np.zeros(n_vars, dtype=float)
+        lower = np.zeros(n_vars, dtype=float)
+        upper = np.ones(n_vars, dtype=float)
+        integrality = np.ones(n_vars, dtype=int)
+
+        # Pre-compute objective and hard feasibility bounds.
+        for v_i, vid in enumerate(V):
             v = veh_map[vid]
-            for sid in S:
+            for s_i, sid in enumerate(S):
                 s = spc_map[sid]
                 idx = space_idx[sid]
+                var = x_idx(v_i, s_i)
+                c[var] = w["distance"] * exit_dist[idx]
+
                 if not is_size_compatible(v["size_needed"], s["size"]):
-                    feasible[(vid, sid)] = False
-                    cost[(vid, sid)] = 1e9
-                else:
-                    feasible[(vid, sid)] = True
-                    ev_pen = w["penalty"] if (v["needs_charger"] and not s["has_charger"]) else 0
-                    cost[(vid, sid)] = w["distance"] * exit_dist[idx] + ev_pen
+                    upper[var] = 0
+                if bool(v["needs_charger"]) and not bool(s["has_charger"]):
+                    upper[var] = 0
 
-        prob = pulp.LpProblem("ParkingAssignment", pulp.LpMinimize)
+            c[y_idx(v_i)] = self.unassigned_penalty
 
-        x = pulp.LpVariable.dicts("x", [(v, s) for v in V for s in S], cat="Binary")
+        rows = []
+        cols = []
+        vals = []
+        lb = []
+        ub = []
+        row = 0
 
-        # Force infeasible pairs to 0
-        for vid in V:
-            for sid in S:
-                if not feasible[(vid, sid)]:
-                    prob += x[(vid, sid)] == 0
+        # Each vehicle is assigned once, either to a real space or dummy y[v].
+        for v_i in range(n_v):
+            for s_i in range(n_s):
+                rows.append(row)
+                cols.append(x_idx(v_i, s_i))
+                vals.append(1.0)
+            rows.append(row)
+            cols.append(y_idx(v_i))
+            vals.append(1.0)
+            lb.append(1.0)
+            ub.append(1.0)
+            row += 1
 
-        # Objective
-        prob += pulp.lpSum(cost[(v, s)] * x[(v, s)] for v in V for s in S)
+        # Same space cannot be assigned to two vehicles whose time intervals overlap.
+        arrivals = vehicles["arrival_time"].to_numpy(dtype=float)
+        departures = arrivals + vehicles["duration_min"].to_numpy(dtype=float)
+        overlap_pairs = [
+            (i, j)
+            for i in range(n_v)
+            for j in range(i + 1, n_v)
+            if max(arrivals[i], arrivals[j]) < min(departures[i], departures[j])
+        ]
+        for s_i in range(n_s):
+            for i, j in overlap_pairs:
+                rows.extend([row, row])
+                cols.extend([x_idx(i, s_i), x_idx(j, s_i)])
+                vals.extend([1.0, 1.0])
+                lb.append(0.0)
+                ub.append(1.0)
+                row += 1
 
-        # Constraint 1: each vehicle gets exactly one space
-        for vid in V:
-            prob += pulp.lpSum(x[(vid, s)] for s in S) == 1
+        constraints = LinearConstraint(
+            coo_array((vals, (rows, cols)), shape=(row, n_vars)).tocsr(),
+            np.array(lb),
+            np.array(ub),
+        )
 
-        # Constraint 2: each space used at most once
-        for sid in S:
-            prob += pulp.lpSum(x[(v, sid)] for v in V) <= 1
+        result = milp(
+            c=c,
+            integrality=integrality,
+            bounds=Bounds(lower, upper),
+            constraints=constraints,
+            options={"time_limit": self.time_limit_sec, "disp": False},
+        )
 
-        solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=self.time_limit_sec)
-        prob.solve(solver)
+        if not result.success and result.x is None:
+            return Assignment(
+                mapping={vid: None for vid in V},
+                cost=float("inf"),
+                solver="ILP",
+                runtime=time.perf_counter() - t0,
+                violations=[f"OPTIMIZER: {result.message}"],
+            )
 
+        sol = result.x
         mapping = {}
-        for vid in V:
-            for sid in S:
-                if pulp.value(x[(vid, sid)]) and pulp.value(x[(vid, sid)]) > 0.5:
+        for v_i, vid in enumerate(V):
+            if sol[y_idx(v_i)] > 0.5:
+                mapping[vid] = None
+                continue
+            for s_i, sid in enumerate(S):
+                if sol[x_idx(v_i, s_i)] > 0.5:
                     mapping[vid] = sid
                     break
             if vid not in mapping:
                 mapping[vid] = None
 
-        total_cost = round(pulp.value(prob.objective) or 0.0, 2)
+        total_cost = round(float(c @ np.rint(sol)), 2)
         violations = GreedySolver()._check_violations(mapping, vehicles, spaces)
+        if not result.success:
+            violations.append(f"OPTIMIZER: {result.message}")
 
         return Assignment(
             mapping=mapping,

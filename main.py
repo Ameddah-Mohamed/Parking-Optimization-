@@ -27,7 +27,6 @@ from evaluator     import print_report, compare
 
 
 # ── default configuration ─────────────────────────────────────────────────────
-
 DEFAULT_CSV        = "data.csv"
 DEFAULT_FLOORS     = 3
 DEFAULT_SPACES     = 20
@@ -36,8 +35,8 @@ DEFAULT_SEED       = 42
 ILP_TIME_LIMIT     = 60   # seconds — increase for larger instances
 
 
-# ── main pipeline ─────────────────────────────────────────────────────────────
 
+# ── main pipeline ─────────────────────────────────────────────────────────────
 def run(
     csv_path:   str = DEFAULT_CSV,
     n_floors:   int = DEFAULT_FLOORS,
@@ -57,10 +56,11 @@ def run(
         dist = extract_distributions(df)
         print(f"      OK — {len(df)} records. "
               f"EV fraction: {dist['ev_fraction']*100:.0f}%, "
-              f"Mean inter-arrival: {dist['mean_interarrival_min']:.1f} min")
+              f"Target occupancy: {dist['target_occupancy']*100:.0f}%")
     except FileNotFoundError:
         print(f"      WARNING: '{csv_path}' not found. Using built-in defaults.")
         dist = None
+
 
     # ── Step 2: Generate instance ──────────────────────────────────────────
     print(f"\n[2/4] Generating synthetic parking instance (seed={seed}) ...")
@@ -76,6 +76,7 @@ def run(
     ev_count = inst.vehicles["needs_charger"].sum()
     charger_count = inst.spaces["has_charger"].sum()
     print(f"      EV vehicles: {ev_count} | EV-capable spaces: {charger_count}")
+
 
     # ── Step 3: Solve ──────────────────────────────────────────────────────
     print("\n[3/4] Running solvers ...")
@@ -101,12 +102,12 @@ def run(
     print("\n[4/4] Evaluation results:")
     print_report(assignments, inst)
 
+
     # Return for programmatic use (e.g. notebooks)
     return inst, assignments
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
-
 def main():
     parser = argparse.ArgumentParser(description="Parking assignment pipeline")
     parser.add_argument("--csv",      default=DEFAULT_CSV,    help="Path to data CSV")
