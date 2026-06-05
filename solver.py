@@ -7,7 +7,11 @@ Two assignment strategies:
                       Assigns each arriving vehicle to the nearest compatible
                       available space. Serves as the baseline.
 
-  2. ILPSolver      — Time-indexed binary integer program.
+  2. GeneticSolver  — population-based metaheuristic for offline assignment.
+
+  3. SimulatedAnnealingSolver — local-search metaheuristic for offline assignment.
+
+  4. ILPSolver      — Time-indexed binary integer program.
                       Optimal for a known arrival/departure stream on
                       small/medium instances.
 
@@ -18,7 +22,6 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
-from typing import Optional
 import time
 
 
@@ -98,6 +101,24 @@ def compute_cost(
     size_penalty = w3 * 0.5 if SIZE_ORDER.get(space["size"], 0) > SIZE_ORDER.get(vehicle["size_needed"], 0) else 0.0
 
     return dist_cost + cong_cost + ev_penalty + size_penalty
+
+
+def _unassigned_penalty(weights: dict) -> float:
+    return weights.get("penalty", 50.0) * 10
+
+
+def _vehicle_intervals(vehicles: pd.DataFrame) -> dict:
+    return {
+        row["vehicle_id"]: (
+            float(row["arrival_time"]),
+            float(row["arrival_time"] + row["duration_min"]),
+        )
+        for _, row in vehicles.iterrows()
+    }
+
+
+def _intervals_overlap(a: tuple[float, float], b: tuple[float, float]) -> bool:
+    return max(a[0], b[0]) < min(a[1], b[1])
 
 
 # ── greedy solver ─────────────────────────────────────────────────────────────
@@ -187,7 +208,7 @@ class GreedySolver:
         for _, v in vehicles.iterrows():
             sid = mapping.get(v["vehicle_id"])
             if sid is None:
-                total += self.weights.get("penalty", 50.0) * 10  # big penalty for unassigned
+                total += _unassigned_penalty(self.weights)
                 continue
             idx = space_idx_map[sid]
             s = spaces.loc[idx]
@@ -198,11 +219,8 @@ class GreedySolver:
     def _check_violations(self, mapping, vehicles, spaces):
         violations = []
         space_idx_map = {row["space_id"]: i for i, row in spaces.iterrows()}
-        assigned_spaces = [v for v in mapping.values() if v is not None]
-
-        # Duplicate assignment check
-        if len(assigned_spaces) != len(set(assigned_spaces)):
-            violations.append("DUPLICATE: same space assigned to multiple vehicles")
+        intervals = _vehicle_intervals(vehicles)
+        by_space = {}
 
         for _, v in vehicles.iterrows():
             sid = mapping.get(v["vehicle_id"])
@@ -213,8 +231,255 @@ class GreedySolver:
             s = spaces.loc[idx]
             if not is_size_compatible(v["size_needed"], s["size"]):
                 violations.append(f"SIZE: {v['vehicle_id']} ({v['size_needed']}) → {sid} ({s['size']})")
+            if bool(v["needs_charger"]) and not bool(s["has_charger"]):
+                violations.append(f"EV: {v['vehicle_id']} requires charger but got {sid}")
+            by_space.setdefault(sid, []).append(v["vehicle_id"])
+
+        for sid, vids in by_space.items():
+            for i, vid_a in enumerate(vids):
+                for vid_b in vids[i + 1:]:
+                    if _intervals_overlap(intervals[vid_a], intervals[vid_b]):
+                        violations.append(f"TIME: {sid} assigned to overlapping vehicles {vid_a}, {vid_b}")
 
         return violations
+
+
+# ── metaheuristic helpers ─────────────────────────────────────────────────────
+
+class _MetaheuristicBase:
+    """Shared repair/evaluation logic for offline stochastic solvers."""
+
+    def __init__(self, weights: dict = None, seed: int = 42):
+        self.weights = weights or {"distance": 1.0, "congestion": 0.5, "penalty": 50.0}
+        self.seed = seed
+
+    def _prepare(self, instance):
+        spaces = instance.spaces.reset_index(drop=True)
+        vehicles = instance.vehicles.reset_index(drop=True)
+        exit_dist = instance.exit_dist
+        feasible = []
+
+        for _, v in vehicles.iterrows():
+            candidates = []
+            for s_idx, s in spaces.iterrows():
+                if not is_size_compatible(v["size_needed"], s["size"]):
+                    continue
+                if bool(v["needs_charger"]) and not bool(s["has_charger"]):
+                    continue
+                candidates.append(int(s_idx))
+            feasible.append(candidates)
+
+        return spaces, vehicles, exit_dist, feasible
+
+    def _random_chromosome(self, feasible, rng):
+        chrom = []
+        for candidates in feasible:
+            choices = candidates + [-1]
+            chrom.append(int(rng.choice(choices)))
+        return np.array(chrom, dtype=int)
+
+    def _greedy_chromosome(self, instance, spaces, vehicles):
+        greedy = GreedySolver(weights=self.weights).solve(instance)
+        space_idx_map = {row["space_id"]: i for i, row in spaces.iterrows()}
+        return np.array([
+            space_idx_map.get(greedy.mapping.get(v["vehicle_id"]), -1)
+            for _, v in vehicles.iterrows()
+        ], dtype=int)
+
+    def _repair_and_score(self, chromosome, spaces, vehicles, exit_dist, feasible):
+        available = set(range(len(spaces)))
+        occupied_until = {}
+        repaired = np.full(len(vehicles), -1, dtype=int)
+        total = 0.0
+
+        for v_idx, v in vehicles.iterrows():
+            arr = float(v["arrival_time"])
+            dep = float(v["arrival_time"] + v["duration_min"])
+
+            newly_freed = [
+                s_idx for s_idx, dep_t in list(occupied_until.items())
+                if dep_t <= arr
+            ]
+            for s_idx in newly_freed:
+                available.add(s_idx)
+                del occupied_until[s_idx]
+
+            candidates = [s_idx for s_idx in feasible[v_idx] if s_idx in available]
+            preferred = int(chromosome[v_idx])
+
+            if preferred in candidates:
+                chosen = preferred
+            elif candidates:
+                chosen = min(candidates, key=lambda s_idx: exit_dist[s_idx])
+            else:
+                chosen = -1
+
+            repaired[v_idx] = chosen
+            if chosen == -1:
+                total += _unassigned_penalty(self.weights)
+                continue
+
+            available.discard(chosen)
+            occupied_until[chosen] = dep
+            total += self.weights.get("distance", 1.0) * exit_dist[chosen]
+
+        return repaired, round(float(total), 2)
+
+    def _mapping_from_chromosome(self, chromosome, spaces, vehicles):
+        mapping = {}
+        for v_idx, v in vehicles.iterrows():
+            s_idx = int(chromosome[v_idx])
+            mapping[v["vehicle_id"]] = None if s_idx == -1 else spaces.loc[s_idx, "space_id"]
+        return mapping
+
+
+class GeneticSolver(_MetaheuristicBase):
+    """
+    Offline genetic algorithm.
+
+    Chromosome: one preferred space index per vehicle. A repair step converts it
+    into a feasible dynamic assignment by respecting availability, size, and EV
+    charger constraints.
+    """
+
+    def __init__(
+        self,
+        weights: dict = None,
+        seed: int = 42,
+        population_size: int = 40,
+        generations: int = 80,
+        mutation_rate: float = 0.08,
+        elite_count: int = 4,
+    ):
+        super().__init__(weights=weights, seed=seed)
+        self.population_size = population_size
+        self.generations = generations
+        self.mutation_rate = mutation_rate
+        self.elite_count = elite_count
+
+    def solve(self, instance) -> Assignment:
+        t0 = time.perf_counter()
+        rng = np.random.default_rng(self.seed)
+        spaces, vehicles, exit_dist, feasible = self._prepare(instance)
+
+        population = [self._greedy_chromosome(instance, spaces, vehicles)]
+        population.extend(
+            self._random_chromosome(feasible, rng)
+            for _ in range(self.population_size - 1)
+        )
+
+        best_chrom = None
+        best_cost = float("inf")
+
+        def score(chrom):
+            repaired, cost = self._repair_and_score(chrom, spaces, vehicles, exit_dist, feasible)
+            return repaired, cost
+
+        def tournament(scored, k=3):
+            contenders = rng.choice(len(scored), size=k, replace=False)
+            return min((scored[i] for i in contenders), key=lambda item: item[1])[0]
+
+        for _ in range(self.generations):
+            scored = [score(chrom) for chrom in population]
+            scored.sort(key=lambda item: item[1])
+
+            if scored[0][1] < best_cost:
+                best_chrom = scored[0][0].copy()
+                best_cost = scored[0][1]
+
+            next_pop = [chrom.copy() for chrom, _ in scored[:self.elite_count]]
+            while len(next_pop) < self.population_size:
+                parent_a = tournament(scored)
+                parent_b = tournament(scored)
+                mask = rng.random(len(parent_a)) < 0.5
+                child = np.where(mask, parent_a, parent_b)
+
+                for gene_idx in range(len(child)):
+                    if rng.random() < self.mutation_rate:
+                        choices = feasible[gene_idx] + [-1]
+                        child[gene_idx] = int(rng.choice(choices))
+
+                next_pop.append(child)
+
+            population = next_pop
+
+        mapping = self._mapping_from_chromosome(best_chrom, spaces, vehicles)
+        violations = GreedySolver(weights=self.weights)._check_violations(mapping, vehicles, spaces)
+        return Assignment(
+            mapping=mapping,
+            cost=best_cost,
+            solver="Genetic",
+            runtime=time.perf_counter() - t0,
+            violations=violations,
+        )
+
+
+class SimulatedAnnealingSolver(_MetaheuristicBase):
+    """
+    Offline simulated annealing heuristic.
+
+    Starts from the greedy solution, repeatedly mutates one vehicle assignment,
+    repairs the schedule, and accepts worse moves with a temperature-controlled
+    probability to escape local minima.
+    """
+
+    def __init__(
+        self,
+        weights: dict = None,
+        seed: int = 42,
+        iterations: int = 1500,
+        initial_temp: float = 200.0,
+        cooling_rate: float = 0.995,
+    ):
+        super().__init__(weights=weights, seed=seed)
+        self.iterations = iterations
+        self.initial_temp = initial_temp
+        self.cooling_rate = cooling_rate
+
+    def solve(self, instance) -> Assignment:
+        t0 = time.perf_counter()
+        rng = np.random.default_rng(self.seed)
+        spaces, vehicles, exit_dist, feasible = self._prepare(instance)
+
+        current = self._greedy_chromosome(instance, spaces, vehicles)
+        current, current_cost = self._repair_and_score(current, spaces, vehicles, exit_dist, feasible)
+        best = current.copy()
+        best_cost = current_cost
+        temp = self.initial_temp
+
+        for _ in range(self.iterations):
+            candidate = current.copy()
+            gene_idx = int(rng.integers(0, len(candidate)))
+            choices = feasible[gene_idx] + [-1]
+            candidate[gene_idx] = int(rng.choice(choices))
+
+            if len(candidate) > 1 and rng.random() < 0.20:
+                other_idx = int(rng.integers(0, len(candidate)))
+                candidate[gene_idx], candidate[other_idx] = candidate[other_idx], candidate[gene_idx]
+
+            candidate, candidate_cost = self._repair_and_score(
+                candidate, spaces, vehicles, exit_dist, feasible
+            )
+            delta = candidate_cost - current_cost
+
+            if delta <= 0 or rng.random() < np.exp(-delta / max(temp, 1e-9)):
+                current = candidate
+                current_cost = candidate_cost
+                if current_cost < best_cost:
+                    best = current.copy()
+                    best_cost = current_cost
+
+            temp *= self.cooling_rate
+
+        mapping = self._mapping_from_chromosome(best, spaces, vehicles)
+        violations = GreedySolver(weights=self.weights)._check_violations(mapping, vehicles, spaces)
+        return Assignment(
+            mapping=mapping,
+            cost=best_cost,
+            solver="Simulated Annealing",
+            runtime=time.perf_counter() - t0,
+            violations=violations,
+        )
 
 
 # ── ILP solver ────────────────────────────────────────────────────────────────
@@ -249,7 +514,7 @@ class ILPSolver:
         self.unassigned_penalty = (
             unassigned_penalty
             if unassigned_penalty is not None
-            else self.weights.get("penalty", 50.0) * 10
+            else _unassigned_penalty(self.weights)
         )
 
     def solve(self, instance) -> Assignment:

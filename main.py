@@ -5,7 +5,7 @@ Orchestrates the full parking assignment pipeline:
 
   1. Load real data → extract distributions
   2. Generate synthetic parking instance
-  3. Solve with Greedy and ILP
+  3. Solve with Greedy, Genetic Algorithm, Simulated Annealing, and ILP
   4. Evaluate and compare
 
 Run:
@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from data_loader   import load, extract_distributions, summarise
 from instance_gen  import create_instance
-from solver        import GreedySolver, ILPSolver
+from solver        import GreedySolver, GeneticSolver, SimulatedAnnealingSolver, ILPSolver
 from evaluator     import print_report, compare
 
 
@@ -33,6 +33,8 @@ DEFAULT_SPACES     = 20
 DEFAULT_VEHICLES   = 60
 DEFAULT_SEED       = 42
 ILP_TIME_LIMIT     = 60   # seconds — increase for larger instances
+GA_GENERATIONS     = 80
+SA_ITERATIONS      = 1500
 
 
 
@@ -43,6 +45,8 @@ def run(
     spaces_per_floor: int = DEFAULT_SPACES,
     n_vehicles: int = DEFAULT_VEHICLES,
     seed:       int = DEFAULT_SEED,
+    skip_ga:    bool = False,
+    skip_sa:    bool = False,
     skip_ilp:   bool = False,
 ):
     print("\n╔══════════════════════════════════════════════╗")
@@ -87,6 +91,24 @@ def run(
 
     assignments = [greedy_result]
 
+    if not skip_ga:
+        print("      → Genetic solver ...", end=" ", flush=True)
+        genetic_result = GeneticSolver(
+            seed=seed,
+            generations=GA_GENERATIONS,
+        ).solve(inst)
+        print(f"done ({genetic_result.runtime:.3f}s)  cost={genetic_result.cost:.1f}")
+        assignments.append(genetic_result)
+
+    if not skip_sa:
+        print("      → Simulated annealing solver ...", end=" ", flush=True)
+        sa_result = SimulatedAnnealingSolver(
+            seed=seed,
+            iterations=SA_ITERATIONS,
+        ).solve(inst)
+        print(f"done ({sa_result.runtime:.3f}s)  cost={sa_result.cost:.1f}")
+        assignments.append(sa_result)
+
     if not skip_ilp:
         if n_vehicles > 80:
             print(f"      → ILP solver ... (large instance: {n_vehicles} vehicles, "
@@ -115,6 +137,8 @@ def main():
     parser.add_argument("--spaces",   type=int, default=DEFAULT_SPACES,   help="Spaces per floor")
     parser.add_argument("--vehicles", type=int, default=DEFAULT_VEHICLES, help="Number of vehicles")
     parser.add_argument("--seed",     type=int, default=DEFAULT_SEED,     help="Random seed")
+    parser.add_argument("--no-ga",    action="store_true",                help="Skip genetic algorithm solver")
+    parser.add_argument("--no-sa",    action="store_true",                help="Skip simulated annealing solver")
     parser.add_argument("--no-ilp",   action="store_true",                help="Skip ILP solver (faster)")
     args = parser.parse_args()
 
@@ -124,6 +148,8 @@ def main():
         spaces_per_floor=args.spaces,
         n_vehicles=args.vehicles,
         seed=args.seed,
+        skip_ga=args.no_ga,
+        skip_sa=args.no_sa,
         skip_ilp=args.no_ilp,
     )
 
